@@ -10,11 +10,12 @@ Tested on: **iPod touch 4th gen, iOS 6.1.6**, jailbroken with p0sixspwn (untethe
 
 | URL | |
 |---|---|
-| `/` | tiny live-view page |
-| `/stream` | `multipart/x-mixed-replace` MJPEG (browsers, VLC, ffplay, ffmpeg, Home Assistant "MJPEG IP Camera") |
-| `/snapshot.jpg` | one JPEG |
-| `/status` | JSON: camera, resolution, viewers, frames, **motion_pct**, `seconds_since_motion`, uptime |
-| `/switch?cam=front\|back` | change camera without restarting |
+| `/` | live-view page with **Back / Front / Both** buttons (switching never reloads the page) |
+| `/stream` | `multipart/x-mixed-replace` MJPEG of the default camera (browsers, VLC, ffplay, ffmpeg, Home Assistant "MJPEG IP Camera") |
+| `/stream/back`, `/stream/front`, `/stream/both` | the same, for a specific view (`/stream?cam=front` also works) |
+| `/snapshot.jpg` | one JPEG of the default camera; `/snapshot/front.jpg`, `/snapshot.jpg?cam=both`, ... |
+| `/status` | JSON: live camera, viewers, frames, **motion_pct** per camera, `seconds_since_motion`, uptime |
+| `/switch?cam=front\|back` | change the *default* camera (what plain `/stream` shows); viewers who ask for a specific camera are not affected |
 
 Everything needs HTTP Basic auth. On first start the daemon generates a random password and writes it to `/var/mobile/Library/Preferences/ipodcamd.conf` (mode 0600). It never runs without a password.
 
@@ -34,6 +35,18 @@ Frames are only JPEG-encoded while somebody is watching (or a snapshot is reques
 Keep the device plugged in, on Wi-Fi, and **do not open the Camera app**: only one process can own the camera. If the camera stops delivering frames for 20 s the daemon exits and launchd restarts it.
 
 The camera takes about 25 s to come up after a reboot (mediaserverd starts late); the daemon waits for it.
+
+## Choosing a camera and seeing both
+
+Each URL names its camera, so two people can look at different cameras at the same time:
+
+```sh
+vlc "http://ipodcam:<password>@<device-ip>:8080/stream/back"
+vlc "http://ipodcam:<password>@<device-ip>:8080/stream/front"
+vlc "http://ipodcam:<password>@<device-ip>:8080/stream/both"   # one picture, back | front side by side
+```
+
+These devices can only run **one camera at a time** (iOS 6 has no multi-camera capture). The daemon therefore follows the viewers: if everybody wants the same camera it simply stays on it; if somebody wants the other one it alternates, `both_dwell` seconds (default 3) per camera, with about a second of warm-up after each switch. In the `both` picture the live tile has a **green bar** and the other tile shows its last frame under a **grey bar**. Expect ~3 fps for `both` and for a camera that is being shared; a single camera watched alone runs at the full rate. When nobody is watching, the daemon returns to the default camera so motion detection keeps watching it.
 
 ## Use it
 
@@ -55,14 +68,16 @@ IPODCAM_URL=http://<device-ip>:8080 IPODCAM_PASS=<password> python3 tools/ipodca
 
 ```
 port=8080
-camera=back            # back | front
+camera=back            # default camera: back | front
 resolution=640x480     # 352x288 | 640x480 | 1280x720 (front camera: 640x480 max)
 fps=10                 # max frames/s per viewer, 1-30
 quality=70             # JPEG 1-100
-rotate=0               # 0 | 90 | 180 | 270, clockwise
+rotate=0               # 0 | 90 | 180 | 270, clockwise (rotate_back / rotate_front override it per camera)
 user=ipodcam
 password=...
 motion_threshold=2.0   # % of the picture that must change
+both_dwell=3.0         # seconds per camera while both are being watched (min 1.5)
+both_layout=side       # side | stack
 ```
 
 Log: `/var/mobile/Library/Logs/ipodcamd.log`.
@@ -89,7 +104,7 @@ The toolchain is the community build [L1ghtmann/llvm-project](https://github.com
 
 ## Known limits
 
-- MJPEG only (no H.264, no audio); a 640x480 frame is 40-100 KB, so roughly 3-9 Mbit/s at 10 fps. Lower `quality` or `fps` on weak Wi-Fi.
+- One camera runs at a time; "both" alternates (see above). MJPEG only (no H.264, no audio); a 640x480 frame is 40-100 KB, so roughly 3-9 Mbit/s at 10 fps. Lower `quality` or `fps` on weak Wi-Fi.
 - Measured on an iPod touch 4 over 2.4 GHz Wi-Fi: about 10 fps at 640x480 / quality 70 and 12 fps at quality 50 (the limit is encoding plus Wi-Fi, not the camera, which delivers 30 fps). 720p is slower.
 - The sensor is a small phone-class camera: expect noise in dim rooms and no night vision.
 

@@ -1,12 +1,16 @@
 /*
  * ipodcamd - headless MJPEG camera server for old iOS devices (iOS 6+, armv7)
  *
- * Streams the device camera over HTTP:
- *   /                 small live-view page
- *   /stream           multipart MJPEG (works in browsers, VLC, ffplay, ffmpeg, Home Assistant, ...)
- *   /snapshot.jpg     single JPEG
- *   /status           JSON (camera, resolution, viewers, motion score, uptime)
- *   /switch?cam=front|back   change camera at runtime
+ * Streams the device cameras over HTTP:
+ *   /                          live-view page with Back / Front / Both buttons (no page reloads)
+ *   /stream[?cam=back|front|both]   multipart MJPEG; also /stream/back, /stream/front, /stream/both
+ *   /snapshot.jpg[?cam=...]    single JPEG; also /snapshot/back.jpg, ...
+ *   /status                    JSON (cameras, viewers, motion score per camera, uptime)
+ *   /switch?cam=front|back     change the default camera (the one used when nobody asks for a specific one)
+ *
+ * Only one camera can run at a time on these devices. When viewers want different cameras the daemon
+ * alternates between them; "both" is a side-by-side picture where the camera that is currently live is
+ * marked with a green bar and the other tile shows its last frame (grey bar).
  *
  * Needs a jailbroken device only to install it and to run it as a LaunchDaemon; it uses no private APIs.
  * Build: see README.md. MIT licensed.
@@ -35,23 +39,28 @@
 #include <sys/time.h>
 #include <unistd.h>
 
-#define IPODCAMD_VERSION "0.1.0"
+#define IPODCAMD_VERSION "0.2.0"
 #define MAX_CONNS 8
 #define DEFAULT_CONF "/var/mobile/Library/Preferences/ipodcamd.conf"
 #define BOUNDARY "ipodcamdframe"
+
+enum { CAM_BACK = 0, CAM_FRONT = 1, CAM_BOTH = 2 };
+static const char *kCamName[3] = {"back", "front", "both"};
 
 /* ------------------------------------------------------------------ config */
 
 typedef struct {
     int port;
-    int front;     /* 0 = back camera, 1 = front camera */
-    int width, height;
-    int fps;       /* max frames per second sent to viewers */
-    int quality;   /* JPEG quality 1..100 */
-    int rotate;    /* 0, 90, 180, 270 (clockwise) */
+    int def_cam;       /* CAM_BACK or CAM_FRONT: used when a request does not name a camera */
+    int width, height; /* back camera preset; the front camera is limited to 640x480 */
+    int fps;           /* max frames per second sent to each viewer */
+    int quality;       /* JPEG quality 1..100 */
+    int rotate[2];     /* per camera: 0, 90, 180, 270 (clockwise) */
     char user[48];
     char pass[64];
     float motion_threshold; /* percent of changed samples that counts as motion */
+    double dwell;           /* seconds per camera when both are being watched */
+    int stack;              /* "both" layout: 0 = side by side, 1 = one above the other */
 } Config;
 
 static Config gCfg;
@@ -92,6 +101,11 @@ static void random_password(char *out, size_t n) {
     out[n - 1] = 0;
 }
 
+static int norm_rot(int r) {
+    r = ((r % 360) + 360) % 360;
+    return (r / 90) * 90;
+}
+
 static void save_config(const char *path) {
     mode_t old = umask(077);
     FILE *f = fopen(path, "w");
@@ -102,15 +116,16 @@ static void save_config(const char *path) {
     }
     fprintf(f,
             "# ipodcamd configuration (restart the daemon after editing)\n"
-            "# camera: back | front\n"
-            "# resolution: 352x288 | 640x480 | 1280x720 (front camera: max 640x480)\n"
-            "# rotate: 0 | 90 | 180 | 270 (clockwise, applied to every frame)\n"
-            "# fps: maximum frames per second sent to viewers; quality: JPEG 1-100\n"
+            "# camera: back | front   (default camera when a request does not name one)\n"
+            "# resolution: 352x288 | 640x480 | 1280x720 (back camera; the front camera is limited to 640x480)\n"
+            "# rotate: 0 | 90 | 180 | 270 (clockwise, both cameras); rotate_back / rotate_front override it\n"
+            "# fps: maximum frames per second sent to each viewer; quality: JPEG 1-100\n"
             "# motion_threshold: percent of the picture that must change to count as motion\n"
+            "# both_dwell: seconds per camera while both are being watched; both_layout: side | stack\n"
             "port=%d\ncamera=%s\nresolution=%dx%d\nfps=%d\nquality=%d\nrotate=%d\n"
-            "user=%s\npassword=%s\nmotion_threshold=%.1f\n",
-            gCfg.port, gCfg.front ? "front" : "back", gCfg.width, gCfg.height, gCfg.fps, gCfg.quality,
-            gCfg.rotate, gCfg.user, gCfg.pass, gCfg.motion_threshold);
+            "user=%s\npassword=%s\nmotion_threshold=%.1f\nboth_dwell=%.1f\nboth_layout=%s\n",
+            gCfg.port, kCamName[gCfg.def_cam], gCfg.width, gCfg.height, gCfg.fps, gCfg.quality, gCfg.rotate[0],
+            gCfg.user, gCfg.pass, gCfg.motion_threshold, gCfg.dwell, gCfg.stack ? "stack" : "side");
     fclose(f);
 }
 
@@ -122,7 +137,9 @@ static void load_config(const char *path) {
     gCfg.fps = 10;
     gCfg.quality = 70;
     gCfg.motion_threshold = 2.0f;
+    gCfg.dwell = 3.0;
     strcpy(gCfg.user, "ipodcam");
+    int rot_all = 0, rot_back = -1, rot_front = -1;
 
     FILE *f = fopen(path, "r");
     if (f) {
@@ -135,17 +152,21 @@ static void load_config(const char *path) {
             *eq = 0;
             char *k = trim(l), *v = trim(eq + 1);
             if (!strcmp(k, "port")) gCfg.port = atoi(v);
-            else if (!strcmp(k, "camera")) gCfg.front = !strcasecmp(v, "front");
+            else if (!strcmp(k, "camera")) gCfg.def_cam = !strcasecmp(v, "front") ? CAM_FRONT : CAM_BACK;
             else if (!strcmp(k, "resolution")) {
                 int w = 0, h = 0;
                 if (sscanf(v, "%dx%d", &w, &h) == 2 && w > 0 && h > 0) { gCfg.width = w; gCfg.height = h; }
             }
             else if (!strcmp(k, "fps")) gCfg.fps = atoi(v);
             else if (!strcmp(k, "quality")) gCfg.quality = atoi(v);
-            else if (!strcmp(k, "rotate")) gCfg.rotate = atoi(v);
+            else if (!strcmp(k, "rotate")) rot_all = atoi(v);
+            else if (!strcmp(k, "rotate_back")) rot_back = atoi(v);
+            else if (!strcmp(k, "rotate_front")) rot_front = atoi(v);
             else if (!strcmp(k, "user")) strlcpy(gCfg.user, v, sizeof gCfg.user);
             else if (!strcmp(k, "password")) strlcpy(gCfg.pass, v, sizeof gCfg.pass);
             else if (!strcmp(k, "motion_threshold")) gCfg.motion_threshold = (float)atof(v);
+            else if (!strcmp(k, "both_dwell")) gCfg.dwell = atof(v);
+            else if (!strcmp(k, "both_layout")) gCfg.stack = !strcasecmp(v, "stack");
         }
         fclose(f);
     }
@@ -154,8 +175,10 @@ static void load_config(const char *path) {
     if (gCfg.fps > 30) gCfg.fps = 30;
     if (gCfg.quality < 1) gCfg.quality = 1;
     if (gCfg.quality > 100) gCfg.quality = 100;
-    gCfg.rotate = ((gCfg.rotate % 360) + 360) % 360;
-    gCfg.rotate = (gCfg.rotate / 90) * 90;
+    if (gCfg.dwell < 1.5) gCfg.dwell = 1.5;
+    if (gCfg.dwell > 60) gCfg.dwell = 60;
+    gCfg.rotate[CAM_BACK] = norm_rot(rot_back >= 0 ? rot_back : rot_all);
+    gCfg.rotate[CAM_FRONT] = norm_rot(rot_front >= 0 ? rot_front : rot_all);
     if (!gCfg.user[0]) strcpy(gCfg.user, "ipodcam");
     if (!gCfg.pass[0]) { /* never run a LAN camera without a password */
         random_password(gCfg.pass, 13);
@@ -166,87 +189,159 @@ static void load_config(const char *path) {
 
 /* ------------------------------------------------------------ shared state */
 
-static NSCondition *gCond;            /* guards gJPEG / gSeq */
-static NSData *gJPEG;
-static uint64_t gSeq;
-static double gJPEGTime;
+static NSCondition *gCond;                 /* guards gJPEG / gSeq */
+static NSData *gJPEG[3];                   /* latest JPEG per view: back, front, both */
+static uint64_t gSeq[3];
 
-static volatile int32_t gConns;        /* open HTTP connections */
-static volatile int32_t gViewers;      /* connections currently streaming */
-static volatile int32_t gSnapWanted;   /* a snapshot request needs a fresh frame */
-static volatile uint64_t gFramesCaptured, gFramesEncoded;
+static NSLock *gImgLock;                   /* guards gImg / gImgSeq / gImgTime */
+static CGImageRef gImg[2];                 /* latest rotated frame per camera */
+static uint64_t gImgSeq[2];
+
+static volatile int32_t gConns;            /* open HTTP connections */
+static volatile int32_t gViewers[3];       /* streaming connections per view */
+static volatile int32_t gSnapWanted[3];    /* snapshot requests waiting for a frame, per view */
+static volatile uint64_t gFramesCaptured;
 static volatile double gLastFrameTime;
-static volatile float gMotionPct;
-static volatile double gLastMotionTime;
+static volatile double gLastDemand;
 static double gStartTime;
-static volatile size_t gFrameW, gFrameH;
-static volatile int gActiveFront;
+static volatile size_t gFrameW[2], gFrameH[2];
 static volatile size_t gLastJPEGBytes;
+static volatile uint64_t gFramesEncoded;
 
 static AVCaptureSession *gSession;
+static AVCaptureDevice *gDevices[2];
+static AVCaptureDeviceInput *gInputs[2];
+static AVCaptureDeviceInput *gCurInput;
+static volatile int gActive = -1;          /* camera currently delivering frames */
+static volatile int gDefaultCam;           /* camera used when nobody asks for a specific one */
+static volatile double gSwitchTime;        /* when the active camera last changed */
+static volatile double gSettleUntil;       /* frames before this are dropped (exposure warm-up) */
 static dispatch_queue_t gCapQueue;
 static NSLock *gSessionLock;
 
-/* ---------------------------------------------------------- image encoding */
+/* ---------------------------------------------------------- image handling */
 
-static NSData *encode_jpeg(void *base, size_t w, size_t h, size_t bpr) {
+/* Copy a camera frame into an image that owns its pixels, applying the configured rotation. */
+static CGImageRef make_image(void *base, size_t w, size_t h, size_t bpr, int rot) {
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
     const CGBitmapInfo bi = kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst; /* BGRA */
     CGContextRef src = CGBitmapContextCreate(base, w, h, 8, bpr, cs, bi);
-    if (!src) { CGColorSpaceRelease(cs); return nil; }
-    CGImageRef img = CGBitmapContextCreateImage(src);
+    if (!src) { CGColorSpaceRelease(cs); return NULL; }
+    CGImageRef srcImg = CGBitmapContextCreateImage(src);
     CGContextRelease(src);
+    if (!srcImg) { CGColorSpaceRelease(cs); return NULL; }
 
-    int rot = gCfg.rotate;
-    if (img && rot != 0) {
-        size_t ow = (rot == 90 || rot == 270) ? h : w;
-        size_t oh = (rot == 90 || rot == 270) ? w : h;
-        CGContextRef dst = CGBitmapContextCreate(NULL, ow, oh, 8, 0, cs, bi);
-        if (dst) {
-            if (rot == 90) {
-                CGContextTranslateCTM(dst, 0, (CGFloat)w);
-                CGContextRotateCTM(dst, -M_PI_2);
-            } else if (rot == 270) {
-                CGContextTranslateCTM(dst, (CGFloat)h, 0);
-                CGContextRotateCTM(dst, M_PI_2);
-            } else {
-                CGContextTranslateCTM(dst, (CGFloat)w, (CGFloat)h);
-                CGContextRotateCTM(dst, M_PI);
-            }
-            CGContextDrawImage(dst, CGRectMake(0, 0, (CGFloat)w, (CGFloat)h), img);
-            CGImageRef rotated = CGBitmapContextCreateImage(dst);
-            CGContextRelease(dst);
-            if (rotated) { CGImageRelease(img); img = rotated; }
-        }
-    }
+    size_t ow = (rot == 90 || rot == 270) ? h : w;
+    size_t oh = (rot == 90 || rot == 270) ? w : h;
+    CGContextRef dst = CGBitmapContextCreate(NULL, ow, oh, 8, 0, cs, bi); /* own memory */
     CGColorSpaceRelease(cs);
-    if (!img) return nil;
+    if (!dst) { CGImageRelease(srcImg); return NULL; }
+    if (rot == 90) {
+        CGContextTranslateCTM(dst, 0, (CGFloat)w);
+        CGContextRotateCTM(dst, -M_PI_2);
+    } else if (rot == 270) {
+        CGContextTranslateCTM(dst, (CGFloat)h, 0);
+        CGContextRotateCTM(dst, M_PI_2);
+    } else if (rot == 180) {
+        CGContextTranslateCTM(dst, (CGFloat)w, (CGFloat)h);
+        CGContextRotateCTM(dst, M_PI);
+    }
+    CGContextDrawImage(dst, CGRectMake(0, 0, (CGFloat)w, (CGFloat)h), srcImg);
+    CGImageRelease(srcImg);
+    CGImageRef out = CGBitmapContextCreateImage(dst);
+    CGContextRelease(dst);
+    return out;
+}
 
+static NSData *jpeg_from_image(CGImageRef img) {
     NSMutableData *data = [NSMutableData dataWithCapacity:64 * 1024];
     CGImageDestinationRef dest = CGImageDestinationCreateWithData((__bridge CFMutableDataRef)data, kUTTypeJPEG, 1, NULL);
-    if (dest) {
-        NSDictionary *opts = @{ (__bridge id)kCGImageDestinationLossyCompressionQuality : @(gCfg.quality / 100.0) };
-        CGImageDestinationAddImage(dest, img, (__bridge CFDictionaryRef)opts);
-        if (!CGImageDestinationFinalize(dest)) data = nil;
-        CFRelease(dest);
-    } else {
-        data = nil;
+    if (!dest) return nil;
+    NSDictionary *opts = @{ (__bridge id)kCGImageDestinationLossyCompressionQuality : @(gCfg.quality / 100.0) };
+    CGImageDestinationAddImage(dest, img, (__bridge CFDictionaryRef)opts);
+    BOOL ok = CGImageDestinationFinalize(dest);
+    CFRelease(dest);
+    return ok ? data : nil;
+}
+
+/* Side-by-side (or stacked) picture of the last frame of each camera. Green bar = live, grey = last frame. */
+static NSData *composite_jpeg(void) {
+    CGImageRef im[2] = {NULL, NULL};
+    [gImgLock lock];
+    for (int c = 0; c < 2; c++) if (gImg[c]) im[c] = CGImageRetain(gImg[c]);
+    [gImgLock unlock];
+    if (!im[0] && !im[1]) return nil;
+
+    size_t tw[2], th[2];
+    for (int c = 0; c < 2; c++) {
+        BOOL portrait = (gCfg.rotate[c] == 90 || gCfg.rotate[c] == 270);
+        tw[c] = portrait ? 480 : 640;
+        th[c] = portrait ? 640 : 480;
     }
-    CGImageRelease(img);
-    return data;
+    size_t W, H, tx[2], ty[2];
+    if (gCfg.stack) {
+        W = tw[0] > tw[1] ? tw[0] : tw[1];
+        H = th[0] + th[1];
+        tx[0] = (W - tw[0]) / 2; ty[0] = th[1];
+        tx[1] = (W - tw[1]) / 2; ty[1] = 0;
+    } else {
+        W = tw[0] + tw[1];
+        H = th[0] > th[1] ? th[0] : th[1];
+        tx[0] = 0;     ty[0] = (H - th[0]) / 2;
+        tx[1] = tw[0]; ty[1] = (H - th[1]) / 2;
+    }
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(NULL, W, H, 8, 0, cs, kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst);
+    CGColorSpaceRelease(cs);
+    if (!ctx) { for (int c = 0; c < 2; c++) if (im[c]) CGImageRelease(im[c]); return nil; }
+    CGContextSetRGBFillColor(ctx, 0.1f, 0.1f, 0.1f, 1.0f);
+    CGContextFillRect(ctx, CGRectMake(0, 0, (CGFloat)W, (CGFloat)H));
+    CGContextSetInterpolationQuality(ctx, kCGInterpolationLow);
+    int active = gActive;
+    for (int c = 0; c < 2; c++) {
+        if (im[c]) {
+            double iw = (double)CGImageGetWidth(im[c]), ih = (double)CGImageGetHeight(im[c]);
+            double s = (double)tw[c] / iw;
+            if ((double)th[c] / ih < s) s = (double)th[c] / ih;
+            double dw = iw * s, dh = ih * s;
+            CGContextDrawImage(ctx, CGRectMake((CGFloat)tx[c] + ((CGFloat)tw[c] - (CGFloat)dw) / 2,
+                                               (CGFloat)ty[c] + ((CGFloat)th[c] - (CGFloat)dh) / 2, (CGFloat)dw, (CGFloat)dh),
+                               im[c]);
+            CGImageRelease(im[c]);
+        }
+        if (c == active) CGContextSetRGBFillColor(ctx, 0.1f, 0.8f, 0.2f, 1.0f);
+        else CGContextSetRGBFillColor(ctx, 0.45f, 0.45f, 0.45f, 1.0f);
+        CGContextFillRect(ctx, CGRectMake((CGFloat)tx[c], (CGFloat)(ty[c] + th[c]) - 6, (CGFloat)tw[c], 6));
+    }
+    CGImageRef out = CGBitmapContextCreateImage(ctx);
+    CGContextRelease(ctx);
+    if (!out) return nil;
+    NSData *jpeg = jpeg_from_image(out);
+    CGImageRelease(out);
+    return jpeg;
+}
+
+static void publish(int idx, NSData *jpeg) {
+    [gCond lock];
+    gJPEG[idx] = jpeg;
+    gSeq[idx]++;
+    [gCond broadcast];
+    [gCond unlock];
 }
 
 /* ------------------------------------------------------------------ motion */
 
 #define MGX 64
 #define MGY 48
-static unsigned char gPrev[MGX * MGY];
-static int gHavePrev;
+static unsigned char gPrev[2][MGX * MGY];
+static int gHavePrev[2];
+static volatile float gMotionPct[2];
+static volatile double gLastMotionTime[2];
 
-/* Compare a 64x48 grid of block-averaged luma values (4x4 pixels each) with the previous call.
- * Averaging suppresses sensor noise; the mean brightness change is subtracted so that
+/* Compare a 64x48 grid of block-averaged luma values (4x4 pixels each) with the previous call for the
+ * same camera. Averaging suppresses sensor noise; the mean brightness change is subtracted so that
  * auto-exposure shifts and flicker do not count as motion. */
-static void update_motion(const unsigned char *base, size_t w, size_t h, size_t bpr) {
+static void update_motion(int c, const unsigned char *base, size_t w, size_t h, size_t bpr) {
     unsigned char cur[MGX * MGY];
     for (int gy = 0; gy < MGY; gy++) {
         size_t y0 = (size_t)gy * h / MGY;
@@ -263,31 +358,41 @@ static void update_motion(const unsigned char *base, size_t w, size_t h, size_t 
             cur[gy * MGX + gx] = (unsigned char)(sum / 16);
         }
     }
-    if (gHavePrev) {
+    if (gHavePrev[c]) {
         long shift = 0;
-        for (int i = 0; i < MGX * MGY; i++) shift += (int)cur[i] - (int)gPrev[i];
+        for (int i = 0; i < MGX * MGY; i++) shift += (int)cur[i] - (int)gPrev[c][i];
         shift /= (MGX * MGY);
         int changed = 0;
         for (int i = 0; i < MGX * MGY; i++) {
-            int d = (int)cur[i] - (int)gPrev[i] - (int)shift;
+            int d = (int)cur[i] - (int)gPrev[c][i] - (int)shift;
             if (d < 0) d = -d;
             if (d > 18) changed++;
         }
         float pct = 100.0f * (float)changed / (float)(MGX * MGY);
-        gMotionPct = pct;
-        if (pct >= gCfg.motion_threshold) gLastMotionTime = now_s();
+        gMotionPct[c] = pct;
+        if (pct >= gCfg.motion_threshold) gLastMotionTime[c] = now_s();
     }
-    memcpy(gPrev, cur, sizeof cur);
-    gHavePrev = 1;
+    memcpy(gPrev[c], cur, sizeof cur);
+    gHavePrev[c] = 1;
 }
 
 /* ----------------------------------------------------------------- capture */
+
+static int camera_of(AVCaptureConnection *conn) {
+    for (AVCaptureInputPort *p in conn.inputPorts) {
+        AVCaptureInput *in = p.input;
+        if (in == (AVCaptureInput *)gInputs[CAM_FRONT]) return CAM_FRONT;
+        if (in == (AVCaptureInput *)gInputs[CAM_BACK]) return CAM_BACK;
+    }
+    return gActive;
+}
 
 @interface CamDelegate : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
 @end
 
 @implementation CamDelegate {
-    double _lastEncode, _lastMotionCheck;
+    double _lastImg[2];
+    double _lastMotion[2];
 }
 - (void)captureOutput:(AVCaptureOutput *)output
     didOutputSampleBuffer:(CMSampleBufferRef)sb
@@ -295,34 +400,52 @@ static void update_motion(const unsigned char *base, size_t w, size_t h, size_t 
     double t = now_s();
     gLastFrameTime = t;
     gFramesCaptured++;
-    BOOL wantEncode = (gSnapWanted > 0) || (gViewers > 0 && (t - _lastEncode) >= 1.0 / (double)gCfg.fps - 0.012);
-    BOOL wantMotion = (t - _lastMotionCheck) >= 0.25;
-    if (!wantEncode && !wantMotion) return;
+    if (t < gSettleUntil) return; /* exposure still settling after a camera switch */
+    int c = camera_of(connection);
+    if (c < 0 || c > 1) return;
+
+    BOOL snap = gSnapWanted[c] > 0 || gSnapWanted[CAM_BOTH] > 0;
+    BOOL wantAny = snap || gViewers[c] > 0 || gViewers[CAM_BOTH] > 0;
+    BOOL wantImage = wantAny && (snap || (t - _lastImg[c]) >= 1.0 / (double)gCfg.fps - 0.012);
+    BOOL wantMotion = (t - _lastMotion[c]) >= 0.25;
+    if (!wantImage && !wantMotion) return;
 
     CVImageBufferRef ib = CMSampleBufferGetImageBuffer(sb);
     if (!ib) return;
     CVPixelBufferLockBaseAddress(ib, 0);
     unsigned char *base = (unsigned char *)CVPixelBufferGetBaseAddress(ib);
     size_t w = CVPixelBufferGetWidth(ib), h = CVPixelBufferGetHeight(ib), bpr = CVPixelBufferGetBytesPerRow(ib);
-    gFrameW = w;
-    gFrameH = h;
+    gFrameW[c] = w;
+    gFrameH[c] = h;
     if (base) {
         if (wantMotion) {
-            _lastMotionCheck = t;
-            update_motion(base, w, h, bpr);
+            _lastMotion[c] = t;
+            update_motion(c, base, w, h, bpr);
         }
-        if (wantEncode) {
-            _lastEncode = t;
-            NSData *jpeg = encode_jpeg(base, w, h, bpr);
-            if (jpeg) {
-                gFramesEncoded++;
-                gLastJPEGBytes = [jpeg length];
-                [gCond lock];
-                gJPEG = jpeg;
-                gJPEGTime = t;
-                gSeq++;
-                [gCond broadcast];
-                [gCond unlock];
+        if (wantImage) {
+            _lastImg[c] = t;
+            CGImageRef img = make_image(base, w, h, bpr, gCfg.rotate[c]);
+            if (img) {
+                [gImgLock lock];
+                if (gImg[c]) CGImageRelease(gImg[c]);
+                gImg[c] = img; /* ownership moves to gImg */
+                gImgSeq[c]++;
+                [gImgLock unlock];
+                if (gViewers[c] > 0 || gSnapWanted[c] > 0) {
+                    NSData *jpeg;
+                    [gImgLock lock]; CGImageRef tmp = gImg[c] ? CGImageRetain(gImg[c]) : NULL; [gImgLock unlock];
+                    jpeg = tmp ? jpeg_from_image(tmp) : nil;
+                    if (tmp) CGImageRelease(tmp);
+                    if (jpeg) {
+                        gFramesEncoded++;
+                        gLastJPEGBytes = [jpeg length];
+                        publish(c, jpeg);
+                    }
+                }
+                if (gViewers[CAM_BOTH] > 0) {
+                    NSData *cj = composite_jpeg();
+                    if (cj) publish(CAM_BOTH, cj);
+                }
             }
         }
     }
@@ -338,59 +461,119 @@ static NSString *preset_for(int w, int h) {
     return AVCaptureSessionPreset640x480;
 }
 
-static BOOL start_session(int front) {
-    [gSessionLock lock];
+/* Make camera c the live one. Caller holds gSessionLock. */
+static BOOL set_input_locked(int c) {
+    if (!gSession || c < 0 || c > 1 || !gInputs[c]) return NO;
+    if (gActive == c && gCurInput == gInputs[c]) return YES;
+    [gSession beginConfiguration];
+    if (gCurInput) [gSession removeInput:gCurInput];
     BOOL ok = NO;
-    if (gSession) {
-        [gSession stopRunning];
-        gSession = nil;
+    if ([gSession canAddInput:gInputs[c]]) {
+        [gSession addInput:gInputs[c]];
+        gCurInput = gInputs[c];
+        ok = YES;
+    } else if (gCurInput && [gSession canAddInput:gCurInput]) {
+        [gSession addInput:gCurInput]; /* put the old one back */
     }
-    AVCaptureDevicePosition want = front ? AVCaptureDevicePositionFront : AVCaptureDevicePositionBack;
-    AVCaptureDevice *dev = nil;
-    for (AVCaptureDevice *d in [AVCaptureDevice devicesWithMediaType:AVMediaTypeVideo]) {
-        if (d.position == want) { dev = d; break; }
+    if (ok) {
+        NSString *want = preset_for(gCfg.width, gCfg.height);
+        if ([gSession canSetSessionPreset:want]) gSession.sessionPreset = want;
+        else if ([gSession canSetSessionPreset:AVCaptureSessionPreset640x480]) gSession.sessionPreset = AVCaptureSessionPreset640x480;
+        else gSession.sessionPreset = AVCaptureSessionPreset352x288;
     }
-    if (!dev) {
-        dev = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
-        front = (dev.position == AVCaptureDevicePositionFront);
+    [gSession commitConfiguration];
+    if (!ok) return NO;
+    AVCaptureDevice *dev = gDevices[c];
+    if (dev && [dev lockForConfiguration:NULL]) {
+        if ([dev isFocusModeSupported:AVCaptureFocusModeContinuousAutoFocus])
+            dev.focusMode = AVCaptureFocusModeContinuousAutoFocus;
+        if ([dev isExposureModeSupported:AVCaptureExposureModeContinuousAutoExposure])
+            dev.exposureMode = AVCaptureExposureModeContinuousAutoExposure;
+        [dev unlockForConfiguration];
     }
-    if (dev) {
-        NSError *err = nil;
-        AVCaptureDeviceInput *input = [AVCaptureDeviceInput deviceInputWithDevice:dev error:&err];
-        AVCaptureSession *s = [[AVCaptureSession alloc] init];
-        NSString *preset = preset_for(gCfg.width, gCfg.height);
-        s.sessionPreset = [s canSetSessionPreset:preset] ? preset : AVCaptureSessionPreset640x480;
-        if (input && [s canAddInput:input]) {
-            [s addInput:input];
-            AVCaptureVideoDataOutput *out = [[AVCaptureVideoDataOutput alloc] init];
-            out.alwaysDiscardsLateVideoFrames = YES;
-            out.videoSettings = @{ (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA) };
-            [out setSampleBufferDelegate:gDelegate queue:gCapQueue];
-            if ([s canAddOutput:out]) {
-                [s addOutput:out];
-                if ([dev lockForConfiguration:NULL]) {
-                    if ([dev isFocusModeSupported:AVCaptureFocusModeContinuousAutoFocus])
-                        dev.focusMode = AVCaptureFocusModeContinuousAutoFocus;
-                    if ([dev isExposureModeSupported:AVCaptureExposureModeContinuousAutoExposure])
-                        dev.exposureMode = AVCaptureExposureModeContinuousAutoExposure;
-                    [dev unlockForConfiguration];
-                }
-                gSession = s;
-                gActiveFront = front;
-                gHavePrev = 0;
-                gLastFrameTime = now_s();
-                [s startRunning];
-                ok = YES;
-                logf_("camera session started: %s camera, preset %s", front ? "front" : "back", [s.sessionPreset UTF8String]);
-            }
-        } else {
-            logf_("cannot open camera input: %s", err ? [[err localizedDescription] UTF8String] : "unknown");
-        }
-    } else {
-        logf_("no video capture device found");
-    }
+    gHavePrev[c] = 0;
+    gActive = c;
+    gSwitchTime = now_s();
+    gSettleUntil = gSwitchTime + 0.6;
+    gLastFrameTime = gSwitchTime;
+    return YES;
+}
+
+static BOOL activate_camera(int c) {
+    [gSessionLock lock];
+    BOOL ok = set_input_locked(c);
     [gSessionLock unlock];
     return ok;
+}
+
+static BOOL start_session(void) {
+    gSession = [[AVCaptureSession alloc] init];
+    for (AVCaptureDevice *d in [AVCaptureDevice devicesWithMediaType:AVMediaTypeVideo]) {
+        int c = (d.position == AVCaptureDevicePositionFront) ? CAM_FRONT : CAM_BACK;
+        if (gDevices[c]) continue;
+        NSError *err = nil;
+        AVCaptureDeviceInput *in = [AVCaptureDeviceInput deviceInputWithDevice:d error:&err];
+        if (!in) {
+            logf_("cannot open %s camera: %s", kCamName[c], err ? [[err localizedDescription] UTF8String] : "unknown");
+            continue;
+        }
+        gDevices[c] = d;
+        gInputs[c] = in;
+    }
+    int first = gInputs[gDefaultCam] ? gDefaultCam : (gInputs[1 - gDefaultCam] ? 1 - gDefaultCam : -1);
+    if (first < 0) {
+        logf_("no usable camera found");
+        return NO;
+    }
+    gDefaultCam = first;
+    AVCaptureVideoDataOutput *out = [[AVCaptureVideoDataOutput alloc] init];
+    out.alwaysDiscardsLateVideoFrames = YES;
+    out.videoSettings = @{ (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA) };
+    [out setSampleBufferDelegate:gDelegate queue:gCapQueue];
+    if (![gSession canAddOutput:out]) {
+        logf_("cannot add video output");
+        return NO;
+    }
+    [gSession addOutput:out];
+    gActive = -1;
+    if (!activate_camera(first)) {
+        logf_("cannot start %s camera", kCamName[first]);
+        return NO;
+    }
+    [gSession startRunning];
+    logf_("camera session started: %s camera live, back %s, front %s, preset %s", kCamName[first],
+          gInputs[CAM_BACK] ? "present" : "missing", gInputs[CAM_FRONT] ? "present" : "missing",
+          [gSession.sessionPreset UTF8String]);
+    return YES;
+}
+
+/* Decides which camera should be live: follows viewers; alternates when both cameras are wanted. */
+static void *scheduler_thread(void *unused) {
+    for (;;) {
+        usleep(100000);
+        int d0 = gViewers[CAM_BACK] + gViewers[CAM_BOTH] + gSnapWanted[CAM_BACK] + gSnapWanted[CAM_BOTH];
+        int d1 = gViewers[CAM_FRONT] + gViewers[CAM_BOTH] + gSnapWanted[CAM_FRONT] + gSnapWanted[CAM_BOTH];
+        double t = now_s();
+        if (d0 || d1) gLastDemand = t;
+        if (!gInputs[CAM_BACK]) d0 = 0;
+        if (!gInputs[CAM_FRONT]) d1 = 0;
+        int cur = gActive, target = cur;
+        if (d0 && d1) {
+            /* A viewer on the other camera gets a full dwell; a mere snapshot request only needs a moment. */
+            int other = 1 - cur;
+            int other_viewers = gViewers[other] + gViewers[CAM_BOTH];
+            double min_live = other_viewers ? gCfg.dwell : 1.0;
+            if (t - gSwitchTime >= min_live) target = other;
+        } else if (d0) {
+            target = CAM_BACK;
+        } else if (d1) {
+            target = CAM_FRONT;
+        } else if (t - gLastDemand > 15.0 && cur != gDefaultCam) {
+            target = gDefaultCam; /* nobody is looking: go back to the default camera so motion detection watches it */
+        }
+        if (target != cur && target >= 0) activate_camera(target);
+    }
+    return NULL;
 }
 
 /* ------------------------------------------------------------------- HTTP */
@@ -481,39 +664,64 @@ static int check_auth(const char *req) {
     return 0;
 }
 
-static NSData *fresh_jpeg(double max_wait) {
-    OSAtomicIncrement32(&gSnapWanted);
-    double deadline = now_s() + max_wait;
-    NSData *d = nil;
-    [gCond lock];
-    uint64_t seq0 = gSeq;
-    while (gSeq == seq0 && now_s() < deadline)
-        [gCond waitUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.2]];
-    BOOL fresh = (gSeq != seq0);
-    d = gJPEG;
-    [gCond unlock];
-    OSAtomicDecrement32(&gSnapWanted);
-    return fresh ? d : nil;
+/* Which view does a request ask for? Looks at the path ("/stream/front") and the query ("?cam=front"). */
+static int view_from(const char *path, const char *query) {
+    const char *src[2] = {path, query};
+    for (int i = 0; i < 2; i++) {
+        if (!src[i]) continue;
+        if (strstr(src[i], "both")) return CAM_BOTH;
+        if (strstr(src[i], "front")) return CAM_FRONT;
+        if (strstr(src[i], "back")) return CAM_BACK;
+    }
+    return gDefaultCam;
 }
 
-static void handle_stream(int fd) {
+static NSData *fresh_jpeg(int idx, double max_wait) {
+    OSAtomicIncrement32(&gSnapWanted[idx]);
+    double deadline = now_s() + max_wait;
+    NSData *out = nil;
+    if (idx == CAM_BOTH) {
+        [gImgLock lock];
+        uint64_t s0 = gImgSeq[0], s1 = gImgSeq[1];
+        [gImgLock unlock];
+        for (;;) {
+            [gImgLock lock];
+            BOOL ok = (!gInputs[0] || gImgSeq[0] > s0) && (!gInputs[1] || gImgSeq[1] > s1);
+            [gImgLock unlock];
+            if (ok) { out = composite_jpeg(); break; }
+            if (now_s() > deadline) break;
+            usleep(50000);
+        }
+    } else {
+        [gCond lock];
+        uint64_t seq0 = gSeq[idx];
+        while (gSeq[idx] == seq0 && now_s() < deadline)
+            [gCond waitUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.2]];
+        if (gSeq[idx] != seq0) out = gJPEG[idx];
+        [gCond unlock];
+    }
+    OSAtomicDecrement32(&gSnapWanted[idx]);
+    return out;
+}
+
+static void handle_stream(int fd, int idx) {
     const char *head =
         "HTTP/1.0 200 OK\r\nServer: ipodcamd/" IPODCAMD_VERSION "\r\nCache-Control: no-cache, no-store, private\r\n"
         "Pragma: no-cache\r\nConnection: close\r\n"
         "Content-Type: multipart/x-mixed-replace; boundary=" BOUNDARY "\r\n\r\n";
     if (send_all(fd, head, strlen(head)) < 0) return;
-    OSAtomicIncrement32(&gViewers);
+    OSAtomicIncrement32(&gViewers[idx]);
     uint64_t last = 0;
     for (;;) {
         NSData *frame = nil;
         [gCond lock];
         double deadline = now_s() + 5.0;
-        while (gSeq == last && now_s() < deadline)
+        while (gSeq[idx] == last && now_s() < deadline)
             [gCond waitUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.5]];
-        if (gSeq != last) { frame = gJPEG; last = gSeq; }
+        if (gSeq[idx] != last) { frame = gJPEG[idx]; last = gSeq[idx]; }
         [gCond unlock];
         if (!frame) {
-            /* camera stalled: keep the connection alive with an empty part boundary */
+            /* camera not live right now (or stalled): keep the connection alive */
             if (send_all(fd, "--" BOUNDARY "\r\n\r\n", strlen("--" BOUNDARY "\r\n\r\n")) < 0) break;
             continue;
         }
@@ -524,29 +732,57 @@ static void handle_stream(int fd) {
         if (send_all(fd, [frame bytes], [frame length]) < 0) break;
         if (send_all(fd, "\r\n", 2) < 0) break;
     }
-    OSAtomicDecrement32(&gViewers);
+    OSAtomicDecrement32(&gViewers[idx]);
 }
 
 static const char *INDEX_HTML =
-    "<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
-    "<title>ipodcamd</title><style>body{font-family:sans-serif;margin:0;background:#111;color:#ddd;text-align:center}"
-    "img{max-width:100%;height:auto}a{color:#8cf;margin:0 .6em}</style></head><body>"
-    "<p><a href=/snapshot.jpg>snapshot</a><a href=/status>status</a><a href='/switch?cam=front'>front</a>"
-    "<a href='/switch?cam=back'>back</a></p><img src=/stream alt=stream></body></html>";
+    "<!doctype html><html><head><meta charset=utf-8>"
+    "<meta name=viewport content='width=device-width,initial-scale=1'><title>ipodcamd</title><style>"
+    "body{font-family:sans-serif;margin:0;background:#111;color:#ddd;text-align:center}"
+    "#bar{padding:.6em}button{font-size:1em;margin:0 .25em;padding:.4em .9em;border:1px solid #567;"
+    "border-radius:4px;background:#222;color:#ddd}button.on{background:#2a6;color:#fff;border-color:#2a6}"
+    ".info{font-size:.8em;color:#9ab;padding:.3em}img{max-width:100%;height:auto}a{color:#8cf}"
+    "</style></head><body><div id=bar>"
+    "<button id=b-back>Back</button><button id=b-front>Front</button><button id=b-both>Both</button>"
+    " <button id=snap>Snapshot</button></div><div class=info><span id=st>&nbsp;</span> <a href=/status>status</a></div>"
+    "<img id=v alt=stream>"
+    "<script>"
+    "var cur=null,img=document.getElementById('v');"
+    "function show(c){cur=c;img.src='/stream?cam='+c+'&_='+new Date().getTime();"
+    "var n=['back','front','both'];for(var i=0;i<3;i++){document.getElementById('b-'+n[i]).className=(n[i]==c)?'on':'';}}"
+    "function snap(){window.open('/snapshot.jpg?cam='+cur,'_blank');}"
+    "function poll(){var x=new XMLHttpRequest();x.open('GET','/status',true);"
+    "x.onreadystatechange=function(){if(x.readyState==4&&x.status==200){try{var s=JSON.parse(x.responseText);"
+    "if(cur===null){show(s.default_camera);}"
+    "document.getElementById('st').textContent='live: '+s.camera+' | '+s.width+'x'+s.height"
+    "+' | motion '+s.motion_pct.toFixed(1)+'% | viewers '+(s.viewers.back+s.viewers.front+s.viewers.both);"
+    "}catch(e){}}};x.send();}"
+    "document.getElementById('b-back').onclick=function(){show('back');};"
+    "document.getElementById('b-front').onclick=function(){show('front');};"
+    "document.getElementById('b-both').onclick=function(){show('both');};"
+    "document.getElementById('snap').onclick=snap;poll();setInterval(poll,2000);"
+    "</script></body></html>";
 
 static void handle_status(int fd) {
     double t = now_s();
-    double since_motion = gLastMotionTime > 0 ? t - gLastMotionTime : -1.0;
-    char body[768];
+    int act = gActive < 0 ? gDefaultCam : gActive;
+    double since[2];
+    for (int c = 0; c < 2; c++) since[c] = gLastMotionTime[c] > 0 ? t - gLastMotionTime[c] : -1.0;
+    char body[1400];
     snprintf(body, sizeof body,
-             "{\"version\":\"" IPODCAMD_VERSION "\",\"camera\":\"%s\",\"width\":%lu,\"height\":%lu,"
-             "\"rotate\":%d,\"fps_limit\":%d,\"quality\":%d,\"viewers\":%d,\"frames_captured\":%llu,"
-             "\"frames_encoded\":%llu,\"last_jpeg_bytes\":%lu,\"seconds_since_frame\":%.2f,"
-             "\"motion_pct\":%.2f,\"motion_threshold\":%.2f,\"seconds_since_motion\":%.1f,\"uptime_s\":%.0f}\n",
-             gActiveFront ? "front" : "back", (unsigned long)gFrameW, (unsigned long)gFrameH, gCfg.rotate, gCfg.fps,
-             gCfg.quality, (int)gViewers, (unsigned long long)gFramesCaptured, (unsigned long long)gFramesEncoded,
-             (unsigned long)gLastJPEGBytes, t - gLastFrameTime, (double)gMotionPct, (double)gCfg.motion_threshold,
-             since_motion, t - gStartTime);
+             "{\"version\":\"" IPODCAMD_VERSION "\",\"camera\":\"%s\",\"default_camera\":\"%s\","
+             "\"width\":%lu,\"height\":%lu,\"fps_limit\":%d,\"quality\":%d,"
+             "\"viewers\":{\"back\":%d,\"front\":%d,\"both\":%d},"
+             "\"frames_captured\":%llu,\"frames_encoded\":%llu,\"last_jpeg_bytes\":%lu,\"seconds_since_frame\":%.2f,"
+             "\"motion_pct\":%.2f,\"motion_threshold\":%.2f,\"seconds_since_motion\":%.1f,"
+             "\"cameras\":{\"back\":{\"present\":%s,\"rotate\":%d,\"motion_pct\":%.2f,\"seconds_since_motion\":%.1f},"
+             "\"front\":{\"present\":%s,\"rotate\":%d,\"motion_pct\":%.2f,\"seconds_since_motion\":%.1f}},"
+             "\"uptime_s\":%.0f}\n",
+             kCamName[act], kCamName[gDefaultCam], (unsigned long)gFrameW[act], (unsigned long)gFrameH[act], gCfg.fps,
+             gCfg.quality, (int)gViewers[0], (int)gViewers[1], (int)gViewers[2], (unsigned long long)gFramesCaptured,
+             (unsigned long long)gFramesEncoded, (unsigned long)gLastJPEGBytes, t - gLastFrameTime, (double)gMotionPct[act],
+             (double)gCfg.motion_threshold, since[act], gInputs[0] ? "true" : "false", gCfg.rotate[0], (double)gMotionPct[0],
+             since[0], gInputs[1] ? "true" : "false", gCfg.rotate[1], (double)gMotionPct[1], since[1], t - gStartTime);
     send_text(fd, 200, "OK", "application/json", body, NULL);
 }
 
@@ -581,11 +817,13 @@ static void *client_thread(void *arg) {
     @autoreleasepool {
         if (!strcmp(path, "/") || !strcmp(path, "/index.html")) {
             send_text(fd, 200, "OK", "text/html; charset=utf-8", INDEX_HTML, NULL);
-        } else if (!strcmp(path, "/stream") || !strcmp(path, "/stream.mjpg") || !strcmp(path, "/video")) {
+        } else if (!strncmp(path, "/stream", 7) || !strcmp(path, "/video")) {
+            int idx = view_from(path + (path[1] == 's' ? 7 : 6), q);
             if (!strcmp(method, "HEAD")) send_text(fd, 200, "OK", "multipart/x-mixed-replace", "", NULL);
-            else handle_stream(fd);
-        } else if (!strcmp(path, "/snapshot.jpg") || !strcmp(path, "/snapshot") || !strcmp(path, "/snap.jpg")) {
-            NSData *d = fresh_jpeg(3.0);
+            else handle_stream(fd, idx);
+        } else if (!strncmp(path, "/snap", 5)) {
+            int idx = view_from(path + 5, q);
+            NSData *d = fresh_jpeg(idx, idx == CAM_BOTH ? 9.0 : 5.0);
             if (!d) {
                 send_text(fd, 503, "Service Unavailable", "text/plain", "no frame available\n", NULL);
             } else {
@@ -600,12 +838,16 @@ static void *client_thread(void *arg) {
         } else if (!strcmp(path, "/status") || !strcmp(path, "/status.json")) {
             handle_status(fd);
         } else if (!strcmp(path, "/switch")) {
-            int front = gActiveFront;
-            if (q && strstr(q, "cam=front")) front = 1;
-            else if (q && strstr(q, "cam=back")) front = 0;
-            else front = !front;
-            BOOL ok = start_session(front);
-            send_text(fd, ok ? 200 : 500, ok ? "OK" : "Error", "text/plain", ok ? "switched\n" : "switch failed\n", NULL);
+            int c = gDefaultCam;
+            if (q && strstr(q, "cam=front")) c = CAM_FRONT;
+            else if (q && strstr(q, "cam=back")) c = CAM_BACK;
+            else c = 1 - c;
+            if (!gInputs[c]) {
+                send_text(fd, 409, "Conflict", "text/plain", "that camera is not available\n", NULL);
+            } else {
+                gDefaultCam = c; /* the scheduler moves to it when nobody is watching another camera */
+                send_text(fd, 200, "OK", "text/plain", "default camera changed\n", NULL);
+            }
         } else {
             send_text(fd, 404, "Not Found", "text/plain", "not found\n", NULL);
         }
@@ -681,19 +923,22 @@ int main(int argc, char **argv) {
         signal(SIGTERM, on_term);
         if (argc > 1) gConfPath = argv[1];
         load_config(gConfPath);
+        gDefaultCam = gCfg.def_cam;
         gStartTime = now_s();
         gCond = [[NSCondition alloc] init];
+        gImgLock = [[NSLock alloc] init];
         gSessionLock = [[NSLock alloc] init];
         gCapQueue = dispatch_queue_create("ipodcamd.capture", NULL);
         gDelegate = [[CamDelegate alloc] init];
         logf_("ipodcamd " IPODCAMD_VERSION " starting (user '%s', port %d)", gCfg.user, gCfg.port);
-        if (!start_session(gCfg.front)) {
+        if (!start_session()) {
             logf_("camera start failed");
             return 1;
         }
-        pthread_t t1, t2;
+        pthread_t t1, t2, t3;
         pthread_create(&t1, NULL, accept_thread, NULL);
         pthread_create(&t2, NULL, watchdog_thread, NULL);
+        pthread_create(&t3, NULL, scheduler_thread, NULL);
     }
     [[NSRunLoop currentRunLoop] run];
     return 0;
