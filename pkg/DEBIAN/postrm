@@ -1,0 +1,6 @@
+#!/bin/sh
+# Keep the configuration (password, camera choice) across upgrades; remove it only on purge.
+if [ "$1" = "purge" ]; then
+  rm -f /var/mobile/Library/Preferences/ipodcamd.conf /var/mobile/Library/Logs/ipodcamd.log
+fi
+exit 0

@@ -1,0 +1,10 @@
+Package: ipodcamd
+Name: ipodcamd
+Version: @VERSION@
+Architecture: iphoneos-arm
+Section: Multimedia
+Priority: optional
+Depends: firmware (>= 6.0)
+Maintainer: Facundo Sterzer Forino <103792623+facundosterzerforino@users.noreply.github.com>
+Author: Facundo Sterzer Forino <103792623+facundosterzerforino@users.noreply.github.com>
+Description: headless MJPEG camera server for old iOS devices (HTTP stream, snapshots, motion score)

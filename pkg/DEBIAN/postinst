@@ -1,0 +1,21 @@
+#!/bin/sh
+# Registers and starts the LaunchDaemon, then prints the generated credentials.
+PLIST=/Library/LaunchDaemons/dev.ipodcamd.plist
+CONF=/var/mobile/Library/Preferences/ipodcamd.conf
+mkdir -p /var/mobile/Library/Logs
+chown mobile:mobile /var/mobile/Library/Logs 2>/dev/null
+launchctl unload "$PLIST" 2>/dev/null
+launchctl load -w "$PLIST"
+# the daemon creates the config (with a random password) on first start
+i=0
+while [ ! -f "$CONF" ] && [ $i -lt 15 ]; do sleep 1; i=$((i+1)); done
+if [ -f "$CONF" ]; then
+  PORT=$(grep '^port=' "$CONF" | sed 's/^port=//')
+  USER=$(grep '^user=' "$CONF" | sed 's/^user=//')
+  PASS=$(grep '^password=' "$CONF" | sed 's/^password=//')
+  echo "ipodcamd is running. Open http://<device-ip>:${PORT}/  user: ${USER}  password: ${PASS}"
+  echo "Settings: $CONF   Log: /var/mobile/Library/Logs/ipodcamd.log"
+else
+  echo "ipodcamd installed, but the config file has not appeared yet; check /var/mobile/Library/Logs/ipodcamd.log"
+fi
+exit 0
