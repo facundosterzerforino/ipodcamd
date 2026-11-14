@@ -16,11 +16,17 @@ if [ ! -d linux/iphone/bin ]; then
   tar xJf toolchain.tar.xz
 fi
 
-# --- SDK: only iPhoneOS9.3.sdk (oldest in theos/sdks; we still target iOS 6.0 with it) ---
+# --- SDK: only iPhoneOS9.3.sdk (oldest in theos/sdks; we still target iOS 6.0 with it), pinned commit ---
 SDK_REPO="https://github.com/theos/sdks.git"
+SDK_COMMIT="0222fd5413cf4b9af096f37b4621afa2688572f7"
 if [ ! -d sdks/iPhoneOS9.3.sdk ]; then
-  [ -d sdks ] || git clone --depth=1 --filter=blob:none --sparse "$SDK_REPO" sdks
-  (cd sdks && git sparse-checkout set iPhoneOS9.3.sdk)
+  rm -rf sdks && mkdir sdks && cd sdks
+  git init -q
+  git remote add origin "$SDK_REPO"
+  git sparse-checkout set iPhoneOS9.3.sdk
+  git fetch -q --depth=1 --filter=blob:none origin "$SDK_COMMIT"
+  git checkout -q FETCH_HEAD
+  cd ..
 fi
 SDK="$TC/sdks/iPhoneOS9.3.sdk"
 
