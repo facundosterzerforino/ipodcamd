@@ -18,7 +18,7 @@ Tested on: **iPod touch 4th gen, iOS 6.1.6**, jailbroken with p0sixspwn (untethe
 
 Everything needs HTTP Basic auth. On first start the daemon generates a random password and writes it to `/var/mobile/Library/Preferences/ipodcamd.conf` (mode 0600). It never runs without a password.
 
-Frames are only JPEG-encoded while somebody is watching (or a snapshot is requested), so an idle camera costs little CPU. Motion detection samples a 64x48 luma grid four times a second.
+Frames are only JPEG-encoded while somebody is watching (or a snapshot is requested), so an idle camera costs little CPU. Motion detection compares a 64x48 grid of block-averaged brightness four times a second and ignores overall brightness shifts (auto-exposure), so a still scene reads ~0 % and a real scene change reads tens of percent.
 
 ## Install (on the device)
 

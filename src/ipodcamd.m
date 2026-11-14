@@ -243,22 +243,35 @@ static NSData *encode_jpeg(void *base, size_t w, size_t h, size_t bpr) {
 static unsigned char gPrev[MGX * MGY];
 static int gHavePrev;
 
-/* Sample a 64x48 grid of luma values and compare with the previous call. */
+/* Compare a 64x48 grid of block-averaged luma values (4x4 pixels each) with the previous call.
+ * Averaging suppresses sensor noise; the mean brightness change is subtracted so that
+ * auto-exposure shifts and flicker do not count as motion. */
 static void update_motion(const unsigned char *base, size_t w, size_t h, size_t bpr) {
     unsigned char cur[MGX * MGY];
     for (int gy = 0; gy < MGY; gy++) {
-        const unsigned char *row = base + ((size_t)gy * h / MGY) * bpr;
+        size_t y0 = (size_t)gy * h / MGY;
         for (int gx = 0; gx < MGX; gx++) {
-            const unsigned char *p = row + ((size_t)gx * w / MGX) * 4; /* B G R X */
-            cur[gy * MGX + gx] = (unsigned char)((p[0] * 29 + p[1] * 150 + p[2] * 77) >> 8);
+            size_t x0 = (size_t)gx * w / MGX;
+            unsigned sum = 0;
+            for (size_t dy = 0; dy < 4; dy++) {
+                const unsigned char *row = base + (y0 + dy) * bpr + x0 * 4; /* B G R X */
+                for (size_t dx = 0; dx < 4; dx++) {
+                    const unsigned char *p = row + dx * 4;
+                    sum += (unsigned)((p[0] * 29 + p[1] * 150 + p[2] * 77) >> 8);
+                }
+            }
+            cur[gy * MGX + gx] = (unsigned char)(sum / 16);
         }
     }
     if (gHavePrev) {
+        long shift = 0;
+        for (int i = 0; i < MGX * MGY; i++) shift += (int)cur[i] - (int)gPrev[i];
+        shift /= (MGX * MGY);
         int changed = 0;
         for (int i = 0; i < MGX * MGY; i++) {
-            int d = (int)cur[i] - (int)gPrev[i];
+            int d = (int)cur[i] - (int)gPrev[i] - (int)shift;
             if (d < 0) d = -d;
-            if (d > 24) changed++;
+            if (d > 18) changed++;
         }
         float pct = 100.0f * (float)changed / (float)(MGX * MGY);
         gMotionPct = pct;
